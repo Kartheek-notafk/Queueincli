@@ -5,7 +5,7 @@ import subprocess
 import sys
 import time
 
-from queuectl import dbcode as db
+from queuectl import db as db
 
 POLL_INTERVAL = 1.0  # seconds between "queue is empty" checks
 IDLE_SLEEP_STEP = 0.2  # sleep in short steps so shutdown signals are responsive
@@ -58,6 +58,17 @@ def list_worker_pids() -> list:
 
 
 def _is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if handle == 0:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+
     try:
         os.kill(pid, 0)
     except OSError:
@@ -67,8 +78,26 @@ def _is_alive(pid: int) -> bool:
 
 def run_job(job: dict) -> int:
     """Execute a job's command via the shell; return its exit code."""
-    proc = subprocess.run(job["command"], shell=True)
+    creationflags = 0
+
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    proc = subprocess.run(
+        job["command"],
+        shell=True,
+        creationflags=creationflags,
+    )
     return proc.returncode
+
+
+def _stop_file_path() -> os.PathLike:
+    db.ensure_dirs()
+    return db.WORKERS_DIR.parent / "stop"
+
+
+def stop_requested() -> bool:
+    return _stop_file_path().exists()
 
 
 def worker_loop(worker_label: str):
@@ -79,23 +108,15 @@ def worker_loop(worker_label: str):
     """
     pid = os.getpid()
     write_pid_file(pid)
-    flag = _ShutdownFlag()
-
-    def _handle_signal(signum, frame):
-        # Deliberately just set a flag. Do NOT raise/exit here: if a job
-        # is currently executing inside run_job()'s subprocess.run(), we
-        # want that call to keep blocking until the child command
-        # finishes (graceful shutdown = finish the in-flight job, then
-        # stop -- never kill it mid-command).
-        flag.requested = True
-
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
 
     print(f"[worker {worker_label} pid={pid}] started", file=sys.stderr, flush=True)
 
     try:
-        while not flag.requested:
+        while True:
+            if stop_requested():
+                print(f"[worker {worker_label} pid={pid}] stop requested", file=sys.stderr, flush=True)
+                break
+
             recovered = db.reap_stale_jobs()
             for jid in recovered:
                 print(
@@ -105,11 +126,8 @@ def worker_loop(worker_label: str):
 
             job = db.claim_next_job(pid)
             if job is None:
-                # Idle: sleep in short steps so a signal during this wait
-                # is picked up almost immediately rather than after a
-                # full POLL_INTERVAL.
                 slept = 0.0
-                while slept < POLL_INTERVAL and not flag.requested:
+                while slept < POLL_INTERVAL and not stop_requested():
                     time.sleep(IDLE_SLEEP_STEP)
                     slept += IDLE_SLEEP_STEP
                 continue
@@ -136,6 +154,10 @@ def worker_loop(worker_label: str):
                     f"(exit {exit_code}, attempt {new_attempts}/{job['max_retries']})",
                     file=sys.stderr, flush=True,
                 )
+
+            if stop_requested():
+                print(f"[worker {worker_label} pid={pid}] stop requested", file=sys.stderr, flush=True)
+                break
     finally:
         remove_pid_file(pid)
         print(f"[worker {worker_label} pid={pid}] stopped", file=sys.stderr, flush=True)

@@ -6,14 +6,14 @@ import signal
 import sys
 import time
 
-from . import dbcode
+from . import db
 from . import workercode as workermod
 
-STOP_TIMEOUT = 20  # seconds to wait for workers to finish their in-flight job
+STOP_TIMEOUT = 60  # seconds to wait for workers to finish their in-flight job
 
 
 def cmd_enqueue(args):
-    dbcode.init_db()
+    db.init_db()
 
     if getattr(args, "job_json", None) is not None:
         if args.id is not None or args.command is not None or args.max_retries is not None:
@@ -45,12 +45,12 @@ def cmd_enqueue(args):
         print("error: job payload must include at least 'id' and 'command'", file=sys.stderr)
         sys.exit(1)
 
-    existing = dbcode.list_jobs()
+    existing = db.list_jobs()
     if any(j["id"] == payload["id"] for j in existing):
         print(f"error: job id '{payload['id']}' already exists", file=sys.stderr)
         sys.exit(1)
 
-    dbcode.enqueue_job(payload)
+    db.enqueue_job(payload)
     print(f"enqueued job {payload['id']}")
 
 
@@ -61,8 +61,26 @@ def _worker_entry(label):
     workermod.worker_loop(label)
 
 
+def _stop_file_path():
+    return db.DATA_DIR / "stop"
+
+
+def _write_stop_file():
+    db.ensure_dirs()
+    _stop_file_path().write_text("stop")
+
+
+def _remove_stop_file():
+    try:
+        _stop_file_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
 def cmd_worker_start(args):
-    dbcode.init_db()
+    db.init_db()
+    _remove_stop_file()
+
     procs = []
     for i in range(args.count):
         p = multiprocessing.Process(target=_worker_entry, args=(f"{i}",), daemon=False)
@@ -78,14 +96,9 @@ def cmd_worker_start(args):
         if stopping["flag"]:
             return
         stopping["flag"] = True
-        print("\nshutdown requested, signaling workers to finish current job...",
+        print("\nshutdown requested, writing stop file to request worker shutdown...",
               file=sys.stderr)
-        for p in procs:
-            if p.pid:
-                try:
-                    os.kill(p.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+        _write_stop_file()
 
     signal.signal(signal.SIGTERM, _forward_shutdown)
     signal.signal(signal.SIGINT, _forward_shutdown)
@@ -97,17 +110,14 @@ def cmd_worker_start(args):
 
 
 def cmd_worker_stop(args):
-    dbcode.init_db()
+    db.init_db()
     pids = workermod.list_worker_pids()
     if not pids:
         print("no running workers found")
         return
 
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+    _write_stop_file()
+    print("stopping workers...", file=sys.stderr)
 
     deadline = time.time() + STOP_TIMEOUT
     remaining = set(pids)
@@ -121,11 +131,12 @@ def cmd_worker_stop(args):
               file=sys.stderr)
     else:
         print(f"stopped {len(pids)} worker(s): {pids}")
+    _remove_stop_file()
 
 
 def cmd_status(args):
-    dbcode.init_db()
-    counts = dbcode.status_counts()
+    db.init_db()
+    counts = db.status_counts()
     live = workermod.list_worker_pids()
     for state in ("pending", "processing", "completed", "failed", "dead"):
         print(f"{state:>10}: {counts.get(state, 0)}")
@@ -133,8 +144,8 @@ def cmd_status(args):
 
 
 def cmd_list(args):
-    dbcode.init_db()
-    jobs = dbcode.list_jobs(state=args.state)
+    db.init_db()
+    jobs = db.list_jobs(state=args.state)
     if args.json:
         # Contract: ONLY the JSON array goes to stdout.
         print(json.dumps(jobs))
@@ -147,8 +158,8 @@ def cmd_list(args):
 
 
 def cmd_dlq_list(args):
-    dbcode.init_db()
-    jobs = dbcode.list_jobs(state="dead")
+    db.init_db()
+    jobs = db.list_jobs(state="dead")
     if args.json:
         print(json.dumps(jobs))
     else:
@@ -160,8 +171,8 @@ def cmd_dlq_list(args):
 
 
 def cmd_dlq_retry(args):
-    dbcode.init_db()
-    ok = dbcode.dlq_retry(args.job_id)
+    db.init_db()
+    ok = db.dlq_retry(args.job_id)
     if ok:
         print(f"re-enqueued {args.job_id} (attempts reset to 0)")
     else:
@@ -170,21 +181,21 @@ def cmd_dlq_retry(args):
 
 
 def cmd_config_set(args):
-    dbcode.init_db()
+    db.init_db()
     key = args.key.replace("-", "_")
     if key not in ("max_retries", "backoff_base"):
         print(f"error: unknown config key '{args.key}'", file=sys.stderr)
         sys.exit(1)
-    dbcode.set_config(key, str(args.value))
+    db.set_config(key, str(args.value))
     print(f"set {args.key} = {args.value} "
           f"(applies to jobs enqueued from now on; existing jobs keep their own max_retries)")
 
 
 def cmd_config_show(args):
-    dbcode.init_db()
-    with dbcode.get_conn() as conn:
+    db.init_db()
+    with db.get_conn() as conn:
         for key in ("max_retries", "backoff_base"):
-            print(f"{key}: {dbcode.get_config(conn, key)}")
+            print(f"{key}: {db.get_config(conn, key)}")
 
 
 def build_parser():
