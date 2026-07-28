@@ -6,39 +6,63 @@ import signal
 import sys
 import time
 
-from . import db
-from . import worker as workermod
+from . import dbcode
+from . import workercode as workermod
 
 STOP_TIMEOUT = 20  # seconds to wait for workers to finish their in-flight job
 
 
 def cmd_enqueue(args):
-    db.init_db()
-    try:
-        payload = json.loads(args.job_json)
-    except json.JSONDecodeError as e:
-        print(f"error: invalid JSON: {e}", file=sys.stderr)
-        sys.exit(1)
+    dbcode.init_db()
+
+    if getattr(args, "job_json", None) is not None:
+        if args.id is not None or args.command is not None or args.max_retries is not None:
+            print(
+                "error: provide either a JSON payload or the --id/--command/--max-retries options, not both",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            payload = json.loads(args.job_json)
+        except json.JSONDecodeError as e:
+            print(f"error: invalid JSON: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if args.id is None or args.command is None:
+            print(
+                "error: --id and --command are required when not using a JSON payload",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        payload = {
+            "id": args.id,
+            "command": args.command,
+        }
+        if args.max_retries is not None:
+            payload["max_retries"] = args.max_retries
 
     if "id" not in payload or "command" not in payload:
-        print("error: job JSON must include at least 'id' and 'command'", file=sys.stderr)
+        print("error: job payload must include at least 'id' and 'command'", file=sys.stderr)
         sys.exit(1)
 
-    existing = db.list_jobs()
+    existing = dbcode.list_jobs()
     if any(j["id"] == payload["id"] for j in existing):
         print(f"error: job id '{payload['id']}' already exists", file=sys.stderr)
         sys.exit(1)
 
-    db.enqueue_job(payload)
+    dbcode.enqueue_job(payload)
     print(f"enqueued job {payload['id']}")
 
 
 def _worker_entry(label):
+    # Re-exec target for multiprocessing.Process: runs in the child's own
+    # OS process (a real fork on Linux), which is what gives us "separate
+    # OS processes, not just threads" for free.
     workermod.worker_loop(label)
 
 
 def cmd_worker_start(args):
-    db.init_db()
+    dbcode.init_db()
     procs = []
     for i in range(args.count):
         p = multiprocessing.Process(target=_worker_entry, args=(f"{i}",), daemon=False)
@@ -73,7 +97,7 @@ def cmd_worker_start(args):
 
 
 def cmd_worker_stop(args):
-    db.init_db()
+    dbcode.init_db()
     pids = workermod.list_worker_pids()
     if not pids:
         print("no running workers found")
@@ -100,8 +124,8 @@ def cmd_worker_stop(args):
 
 
 def cmd_status(args):
-    db.init_db()
-    counts = db.status_counts()
+    dbcode.init_db()
+    counts = dbcode.status_counts()
     live = workermod.list_worker_pids()
     for state in ("pending", "processing", "completed", "failed", "dead"):
         print(f"{state:>10}: {counts.get(state, 0)}")
@@ -109,8 +133,8 @@ def cmd_status(args):
 
 
 def cmd_list(args):
-    db.init_db()
-    jobs = db.list_jobs(state=args.state)
+    dbcode.init_db()
+    jobs = dbcode.list_jobs(state=args.state)
     if args.json:
         # Contract: ONLY the JSON array goes to stdout.
         print(json.dumps(jobs))
@@ -123,8 +147,8 @@ def cmd_list(args):
 
 
 def cmd_dlq_list(args):
-    db.init_db()
-    jobs = db.list_jobs(state="dead")
+    dbcode.init_db()
+    jobs = dbcode.list_jobs(state="dead")
     if args.json:
         print(json.dumps(jobs))
     else:
@@ -136,8 +160,8 @@ def cmd_dlq_list(args):
 
 
 def cmd_dlq_retry(args):
-    db.init_db()
-    ok = db.dlq_retry(args.job_id)
+    dbcode.init_db()
+    ok = dbcode.dlq_retry(args.job_id)
     if ok:
         print(f"re-enqueued {args.job_id} (attempts reset to 0)")
     else:
@@ -146,21 +170,21 @@ def cmd_dlq_retry(args):
 
 
 def cmd_config_set(args):
-    db.init_db()
+    dbcode.init_db()
     key = args.key.replace("-", "_")
     if key not in ("max_retries", "backoff_base"):
         print(f"error: unknown config key '{args.key}'", file=sys.stderr)
         sys.exit(1)
-    db.set_config(key, str(args.value))
+    dbcode.set_config(key, str(args.value))
     print(f"set {args.key} = {args.value} "
           f"(applies to jobs enqueued from now on; existing jobs keep their own max_retries)")
 
 
 def cmd_config_show(args):
-    db.init_db()
-    with db.get_conn() as conn:
+    dbcode.init_db()
+    with dbcode.get_conn() as conn:
         for key in ("max_retries", "backoff_base"):
-            print(f"{key}: {db.get_config(conn, key)}")
+            print(f"{key}: {dbcode.get_config(conn, key)}")
 
 
 def build_parser():
@@ -168,7 +192,10 @@ def build_parser():
     sub = p.add_subparsers(dest="command", required=True)
 
     p_enq = sub.add_parser("enqueue", help="Add a new job")
-    p_enq.add_argument("job_json", help='JSON job spec, e.g. \'{"id":"job1","command":"sleep 2"}\'')
+    p_enq.add_argument("job_json", nargs="?", help='JSON job spec, e.g. "{\"id\":\"job1\",\"command\":\"sleep 2\"}"')
+    p_enq.add_argument("--id")
+    p_enq.add_argument("--command")
+    p_enq.add_argument("--max-retries", type=int)
     p_enq.set_defaults(func=cmd_enqueue)
 
     p_worker = sub.add_parser("worker", help="Manage workers")
