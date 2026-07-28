@@ -69,39 +69,15 @@ Rejected: Process-group IDs. Tracking process groups instead of individual PIDs 
 
 ## 5. If priorities were added tomorrow (high-priority jobs jump the queue), which parts of your design survive unchanged and which break?
 
-**Survives unchanged:**
-- The atomicity mechanism (Q1) — claiming is still "one UPDATE picks a row
-  via a subquery, in one transaction." Priority just changes the subquery's
-  `ORDER BY`.
-- Crash recovery (`reap_stale_jobs`) — completely orthogonal to ordering;
-  it only cares about `state` and `updated_at`.
-- The DLQ, retry/backoff math, and `dlq retry` semantics — none of that
-  depends on queue ordering.
-- The worker-discovery/`worker stop` mechanism (PID files) — unrelated to
-  job ordering.
-- The CLI/interface contract (`--json`, signal semantics) — unaffected.
+The atomic job-claiming logic (Q1). Jobs are still claimed with a single atomic UPDATE; only the ordering of candidate jobs changes.
+Crash recovery with reap_stale_jobs(), since it only depends on state and updated_at.
+The DLQ, retry/backoff logic, and dlq retry behavior, as they don't depend on job ordering.
+Worker discovery and worker stop using PID files.
+The existing CLI interface (--json, signal handling, etc.).
 
-**Breaks or needs extension:**
-- The claim query's `ORDER BY created_at ASC` (`db.py` line 162) is the one
-  line that directly encodes "FIFO." Adding priority means adding a
-  `priority INTEGER` column to the schema and changing that single
-  `ORDER BY` to `ORDER BY priority DESC, created_at ASC`. This is a small,
-  contained change precisely because ordering and atomicity are separate
-  concerns in this design — the subquery decides *which* row, the
-  surrounding UPDATE decides *how safely* it's claimed.
-- `enqueue_job()` and the CLI's `enqueue` command would need a new,
-  optional `priority` field in the job JSON (defaulting to, say, 0), plus
-  schema migration handling for existing DB files created before the
-  column existed (currently `SCHEMA` uses `CREATE TABLE IF NOT EXISTS`,
-  which won't add columns to an already-created table — a real migration
-  step, e.g. `ALTER TABLE jobs ADD COLUMN priority INTEGER DEFAULT 0`
-  guarded by a check, would be needed).
-- Backoff-driven re-queueing (`next_run_at`) interacts with priority in a
-  way that needs a design call: does a low-priority job whose backoff timer
-  just expired jump ahead of a high-priority job that's still waiting on
-  its own backoff? The current `ORDER BY` would need a documented tie-break
-  rule here, which doesn't exist today because there's only one ordering
-  dimension.
-- `queuectl status`/`queuectl list` output would likely want to show
-  priority, and `config` might grow a `default-priority` knob — purely
-  additive, not breaking.
+Would need changes:
+
+The claim query currently uses ORDER BY created_at ASC to implement FIFO. To support priorities, I'd add a priority INTEGER column and change it to ORDER BY priority DESC, created_at ASC. The atomic claiming logic itself wouldn't change—only the ordering criteria.
+enqueue_job() and the enqueue CLI command would need an optional priority field (defaulting to 0). Existing databases would also require a schema migration because CREATE TABLE IF NOT EXISTS doesn't add new columns to an existing table.
+Priority also introduces a policy decision when combined with retry backoff. For example, should a low-priority job whose backoff has just expired run before a higher-priority job that is already waiting? That tie-breaking rule would need to be clearly defined.
+Finally, commands like queuectl status and queuectl list would likely display job priorities, and the configuration could optionally support a default priority. These are additive changes and don't affect the core design.
