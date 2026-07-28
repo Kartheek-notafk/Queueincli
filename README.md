@@ -1,6 +1,5 @@
 # Queueincli
 
-# queuectl
 
 A minimal, crash-safe, multi-process background job queue, driven entirely
 by a CLI. Built for the QueueCTL backend take-home assignment.
